@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Alex Borsody LLM parameters PoC Dashboard for OCI</title>
+  <title>Sourceselect — RAG you can actually tune</title>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
     :root {
@@ -358,6 +358,17 @@
       border-radius: 999px;
       padding: 7px 9px;
     }
+    a.citation { text-decoration: none; cursor: pointer; }
+    a.citation:hover { border-color: var(--accent); }
+    .banner {
+      font-size: 12px;
+      color: var(--text);
+      background: rgba(120, 90, 20, .25);
+      border: 1px solid rgba(200, 150, 40, .45);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+    }
 
     .query-box {
       display: flex;
@@ -444,7 +455,7 @@
       </nav>
 
       <div class="user-card">
-        <div class="avatar">AB</div>
+        <div class="avatar">SS</div>
         <div style="min-width:0">
           <div style="font-weight:700">Source Select User</div>
           <div class="hint">Prototype Mode</div>
@@ -648,6 +659,7 @@
                   <input type="range" min="0" max="1" step="0.01" x-model.number="settings[control.key]" />
                 </div>
               </template>
+              <p class="hint" style="margin-top:10px">Bias sliders are prompt-level guidance, not a model guarantee.</p>
             </div>
             <div class="card source-list">
               <template x-for="item in safetyToggles" :key="item.key">
@@ -667,6 +679,7 @@
           <div class="section-head">
             <h3>Preset Manager</h3>
             <p>Save, manage, and share behavior/source configurations.</p>
+            <p class="hint">Presets are synced locally in this browser — DB-backed sync is Phase 2.</p>
           </div>
           <div class="preset-grid">
             <template x-for="preset in presets" :key="preset.name">
@@ -703,10 +716,10 @@
         <section class="panel">
           <div class="panel-body">
             <div class="section-head">
-              <h3>Prototype Notes</h3>
-              <p>This UI uses mocked state. Backend RAG integration can be added behind /api/ask.</p>
+              <h3>Backend Status</h3>
+              <p>Ask calls the backend <code>/ask</code> endpoint at the configured API base URL. When the backend is unreachable, the UI falls back to the local preview.</p>
             </div>
-            <button class="btn btn-primary" @click="generateMockAnswer()">Generate Mock Answer</button>
+            <button class="btn btn-primary" @click="generateMockAnswer()">Generate Local Preview</button>
           </div>
         </section>
       </div>
@@ -723,12 +736,25 @@
       <div class="response-card">
         <div class="question-bubble" x-text="lastQuestion"></div>
         <div class="answer-bubble">
-          <p x-text="mockAnswer"></p>
-          <div class="citation-list">
+          <div class="hint" x-show="asking">Asking…</div>
+          <div class="banner" x-show="banner" x-text="banner"></div>
+          <p x-text="answer || mockAnswer"></p>
+          <div class="hint" x-show="refusalReason" style="margin-top:8px" x-text="'Not answered: ' + refusalReason"></div>
+          <div class="citation-list" x-show="citations.length">
+            <template x-for="c in citations" :key="c.url || c.source_title">
+              <a class="citation" :href="c.url || null" target="_blank" rel="noopener" :title="c.excerpt || ''" x-text="c.source_title + (c.score != null ? ' · ' + Number(c.score).toFixed(2) : '')"></a>
+            </template>
+          </div>
+          <div class="citation-list" x-show="!citations.length">
             <template x-for="source in enabledSources().slice(0, 4)" :key="source.id">
               <span class="citation" x-text="source.name"></span>
             </template>
             <span class="citation" x-show="enabledSources().length > 4" x-text="'+' + (enabledSources().length - 4) + ' more'"></span>
+          </div>
+          <div class="chip-row" x-show="warnings.length" style="margin-top:8px">
+            <template x-for="w in warnings" :key="w">
+              <span class="citation" x-text="w"></span>
+            </template>
           </div>
         </div>
       </div>
@@ -741,12 +767,26 @@
   </div>
 
   <script>
+    // --- Sourceselect backend (Phase 1) ---------------------------------------
+    // Set at deploy time. The page keeps working fully offline when unreachable.
+    // Never commit a real API key here — inject it at deploy time.
+    const SOURCSELECT_API_BASE = 'https://<gateway-host>/api';
+    const SOURCSELECT_API_KEY = ''; // gateway usage-plan key; leave empty if the gateway is open
+    const SOURCSELECT_TIMEOUT_MS = 120000;
+
     function sourceSelectApp() {
       return {
         activeNav: 'chat',
         activeTab: 'behavior',
         currentPreset: 'Research Mode',
         query: '',
+        answer: '',
+        citations: [],
+        retrievalDebug: null,
+        refusalReason: '',
+        asking: false,
+        warnings: [],
+        banner: '',
         newSource: '',
         newStopSequence: '',
         lastQuestion: 'What are the key factors driving the future of renewable energy adoption?',
@@ -776,7 +816,6 @@
         ],
         formats: ['Plain Text', 'Markdown', 'JSON', 'Table', 'Bullet Points'],
         settings: {
-          creativity: 0.72,
           topP: 0.90,
           responseLength: 0.65,
           verbosity: 0.40,
@@ -811,7 +850,7 @@
           citations: true
         },
         behaviorControls: [
-          { key: 'creativity', label: 'Creativity / Temperature', hint: 'Higher means more varied responses.' },
+          { key: 'temperature', label: 'Creativity / Temperature', hint: 'Same control as Temperature — higher means more varied responses.' },
           { key: 'topP', label: 'Top P / Nucleus Sampling', hint: 'Controls sampling breadth.' },
           { key: 'responseLength', label: 'Response Length', hint: 'Shorter or more complete outputs.' },
           { key: 'verbosity', label: 'Verbosity', hint: 'Controls detail density.' },
@@ -858,11 +897,11 @@
           { id: 6, name: 'Personal Notes', type: 'Private', enabled: true, weight: 0.60 }
         ],
         presets: [
-          { name: 'Research Mode', description: 'Balanced, factual, citation-focused.', values: { creativity: .35, faithfulness: .92, verbosity: .48, reasoningDepth: .82, precisionRecall: .72 } },
-          { name: 'Creative Mode', description: 'High creativity and ideation.', values: { creativity: .92, faithfulness: .55, verbosity: .70, reasoningDepth: .58, precisionRecall: .40 } },
-          { name: 'Analytical Mode', description: 'Logic-driven and structured.', values: { creativity: .30, faithfulness: .84, verbosity: .55, reasoningDepth: .90, precisionRecall: .80 } },
-          { name: 'Skeptical Mode', description: 'Critical thinking and fact checking.', values: { creativity: .25, faithfulness: .95, verbosity: .45, reasoningDepth: .88, precisionRecall: .85 } },
-          { name: 'Concise Mode', description: 'Short, direct answers.', values: { creativity: .35, faithfulness: .80, verbosity: .18, responseLength: .25, reasoningDepth: .55 } }
+          { name: 'Research Mode', description: 'Balanced, factual, citation-focused.', values: { temperature: .35, faithfulness: .92, verbosity: .48, reasoningDepth: .82, precisionRecall: .72 } },
+          { name: 'Creative Mode', description: 'High creativity and ideation.', values: { temperature: .92, faithfulness: .55, verbosity: .70, reasoningDepth: .58, precisionRecall: .40 } },
+          { name: 'Analytical Mode', description: 'Logic-driven and structured.', values: { temperature: .30, faithfulness: .84, verbosity: .55, reasoningDepth: .90, precisionRecall: .80 } },
+          { name: 'Skeptical Mode', description: 'Critical thinking and fact checking.', values: { temperature: .25, faithfulness: .95, verbosity: .45, reasoningDepth: .88, precisionRecall: .85 } },
+          { name: 'Concise Mode', description: 'Short, direct answers.', values: { temperature: .35, faithfulness: .80, verbosity: .18, responseLength: .25, reasoningDepth: .55 } }
         ],
         stopSequences: ['\\n\\n', '###', 'User:', '<end>'],
 
@@ -901,23 +940,72 @@
           alert('Preset saved locally for prototype. Backend save comes later.');
           this.persist();
         },
-        addSource() {
+        async addSource() {
           const name = this.newSource.trim();
           if (!name) return;
-          this.sources.push({ id: Date.now(), name, type: 'Custom', enabled: true, weight: 0.5 });
+          const entry = { id: Date.now(), name, type: 'Custom', enabled: true, weight: 0.5 };
+          this.sources.push(entry);
           this.newSource = '';
+          // Best-effort backend ingest; the local entry stays if the backend is unreachable.
+          try {
+            const data = await ingestSource(name);
+            if (data && data.source_id) entry.id = data.source_id; // reference the real DB row
+            if (data && (data.warnings || []).indexOf('unchanged_content') !== -1) {
+              this.showBanner('Source already ingested — skipped.');
+            } else if (data) {
+              this.showBanner('Ingested: ' + (data.chunks || 0) + ' chunks.');
+            }
+          } catch (e) {
+            console.warn('ingest failed, kept local entry:', e);
+          }
         },
         addStopSequence() {
           if (!this.newStopSequence.trim()) return;
           this.stopSequences.push(this.newStopSequence.trim());
           this.newStopSequence = '';
         },
-        askQuestion() {
+        async askQuestion() {
+          const q = (this.query || '').trim();
+          if (!q) return;
+          this.lastQuestion = q;
+          this.asking = true;
+          this.answer = '';
+          this.citations = [];
+          this.refusalReason = '';
+          this.warnings = [];
+          this.banner = '';
+          const body = buildAskRequest.call(this, q);
+          try {
+            const res = await fetchJson(SOURCSELECT_API_BASE + '/ask', body);
+            const data = res.data;
+            if (res.status === 422 && data && data.refused) {
+              // Honest refusal: show the explanation, not a hallucination.
+              this.answer = data.answer;
+              this.refusalReason = (data.warnings || []).join(', ');
+              return;
+            }
+            if (res.status < 200 || res.status >= 300) throw new Error((data && data.message) || ('HTTP ' + res.status));
+            this.answer = data.answer;              // markdown — render as today
+            this.citations = data.citations || []; // rendered under the answer
+            this.retrievalDebug = data.retrieval_debug;
+            if ((data.warnings || []).length) this.showWarnings(data.warnings);
+          } catch (err) {
+            // Offline fallback: keep the old mocked path so the UI never hard-fails.
+            console.warn('API unreachable, using local fallback:', err);
+            this.showBanner('Backend unreachable — showing local preview.');
+            this.askQuestionMock();
+          } finally {
+            this.asking = false;
+          }
+        },
+        askQuestionMock() {
           if (!this.query.trim()) return;
           this.lastQuestion = this.query.trim();
           this.generateMockAnswer();
           this.query = '';
         },
+        showBanner(msg) { this.banner = msg; },
+        showWarnings(list) { this.warnings = list || []; },
         generateMockAnswer() {
           const names = this.enabledSources().map(s => s.name).slice(0, 3).join(', ');
           const mode = this.currentPreset;
@@ -928,6 +1016,94 @@
           this.mockAnswer = 'Your next response will use the active preset, enabled sources, retrieval settings, and citation rules shown in the dashboard.';
         }
       }
+    }
+
+    // --- Backend helpers (standalone; called with the Alpine component as `this`) ---
+
+    async function fetchJson(url, body, timeoutMs) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs || SOURCSELECT_TIMEOUT_MS);
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (SOURCSELECT_API_KEY) headers['x-api-key'] = SOURCSELECT_API_KEY;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(body),
+          signal: ctrl.signal
+        });
+        let data = null;
+        try { data = await res.json(); } catch (e) { data = null; }
+        return { status: res.status, data: data };
+      } finally {
+        clearTimeout(t);
+      }
+    }
+
+    // Maps every dashboard control to the /ask request contract (§3 of wiring.md).
+    function buildAskRequest(q) {
+      const s = this.settings;
+      return {
+        query: q,
+        top_k: s.topK,
+        similarity_threshold: s.similarity,
+        recency_boost: s.recencyBoost,
+        diversity_boost: s.diversityBoost,
+        rerank: !!s.rerank,
+        precision_recall: s.precisionRecall,
+        sources: (this.sources || []).map(x => ({ source_id: x.id, enabled: !!x.enabled, weight: +x.weight || 1 })),
+        temperature: s.temperature,
+        top_p: s.topP,
+        max_tokens: s.maxTokens,
+        context_window: s.contextWindow,
+        repetition_penalty: s.repetitionPenalty,
+        presence_penalty: s.presencePenalty,
+        frequency_penalty: s.frequencyPenalty,
+        stop_sequences: this.stopSequences || [],
+        tone: s.tone,
+        faithfulness: s.faithfulness,
+        confidence_threshold: s.confidence,
+        filters: {
+          hate: s.hateFilter,
+          violence: s.violenceFilter,
+          adult: s.adultFilter,
+          misinformation_check: !!s.misinformationCheck,
+          pii_protection: !!s.piiProtection
+        },
+        stream: false // Phase 1b
+      };
+    }
+
+    async function ingestSource(urlOrName) {
+      const isUrl = /^https?:\/\//i.test(urlOrName);
+      const res = await fetchJson(
+        SOURCSELECT_API_BASE + '/ingest',
+        isUrl
+          ? { type: 'url', url: urlOrName }
+          : { type: 'text', content: urlOrName, source_title: urlOrName.slice(0, 80) }
+      );
+      const data = res.data;
+      if (res.status < 200 || res.status >= 300) throw new Error((data && data.message) || ('HTTP ' + res.status));
+      // data = { source_id, job_id, chunks, status, warnings }
+      if (data && data.status === 'RUNNING' && data.job_id) {
+        return pollIngest(data.job_id); // forward-compatible with the Phase 1b queue
+      }
+      return data;
+    }
+
+    async function pollIngest(jobId) {
+      // Phase 1 processes inline (DONE); poll only when a queued backend reports RUNNING.
+      const deadline = Date.now() + 60000;
+      let last = null;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 2000));
+        const headers = {};
+        if (SOURCSELECT_API_KEY) headers['x-api-key'] = SOURCSELECT_API_KEY;
+        const res = await fetch(SOURCSELECT_API_BASE + '/ingest/' + encodeURIComponent(jobId), { headers: headers });
+        try { last = await res.json(); } catch (e) { last = null; }
+        if (!last || last.status !== 'RUNNING') return last;
+      }
+      return last;
     }
   </script>
 </body>
