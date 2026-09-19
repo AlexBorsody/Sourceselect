@@ -716,7 +716,10 @@
         <section class="panel">
           <div class="panel-body">
             <div class="section-head">
-              <h3>Backend Status</h3>
+              <h3>Backend Status
+                <span x-show="backendLive" style="color:var(--success); font-size:14px">● Live</span>
+                <span x-show="!backendLive" style="color:var(--warning); font-size:14px">● Offline (local preview)</span>
+              </h3>
               <p>Ask calls the backend <code>/ask</code> endpoint at the configured API base URL. When the backend is unreachable, the UI falls back to the local preview.</p>
             </div>
             <button class="btn btn-primary" @click="generateMockAnswer()">Generate Local Preview</button>
@@ -770,7 +773,7 @@
     // --- Sourceselect backend (Phase 1) ---------------------------------------
     // Set at deploy time. The page keeps working fully offline when unreachable.
     // Never commit a real API key here — inject it at deploy time.
-    const SOURCSELECT_API_BASE = 'https://<gateway-host>/api';
+    const SOURCSELECT_API_BASE = 'https://us-east1-sourceselect-ai.cloudfunctions.net';
     const SOURCSELECT_API_KEY = ''; // gateway usage-plan key; leave empty if the gateway is open
     const SOURCSELECT_TIMEOUT_MS = 120000;
 
@@ -785,6 +788,7 @@
         retrievalDebug: null,
         refusalReason: '',
         asking: false,
+        backendLive: false,
         warnings: [],
         banner: '',
         newSource: '',
@@ -918,6 +922,26 @@
           this.$watch('settings', () => this.persist(), { deep: true });
           this.$watch('sources', () => this.persist(), { deep: true });
           this.$watch('currentPreset', () => this.persist());
+          this.checkBackend();
+        },
+        async checkBackend() {
+          // Lightweight liveness probe: the API answers OPTIONS with 204.
+          try {
+            const res = await fetch(SOURCSELECT_API_BASE + '/ask', { method: 'OPTIONS' });
+            this.backendLive = res.status === 204;
+          } catch (e) { this.backendLive = false; }
+          if (this.backendLive) {
+            // Mock sources (numeric ids) don't exist in the real DB — drop
+            // them so /ask doesn't 404; keep real ones (string ids).
+            const real = (this.sources || []).filter(s => typeof s.id === 'string');
+            if (real.length !== this.sources.length) {
+              this.sources = real;
+              this.persist();
+            }
+            if (!this.sources.length) {
+              this.showBanner('Connected to the live backend. Add a source URL or paste text in RAG & Sources to begin.');
+            }
+          }
         },
         persist() {
           localStorage.setItem('source-select-state', JSON.stringify({
@@ -1043,6 +1067,9 @@
     // Maps every dashboard control to the /ask request contract (§3 of wiring.md).
     function buildAskRequest(q) {
       const s = this.settings;
+      // Frontend-only tone names the backend doesn't know map to real ones.
+      const toneMap = { direct: 'concise', skeptical: 'neutral', executive: 'formal' };
+      const toneRaw = (s.tone || 'neutral').toLowerCase();
       return {
         query: q,
         top_k: s.topK,
@@ -1051,7 +1078,10 @@
         diversity_boost: s.diversityBoost,
         rerank: !!s.rerank,
         precision_recall: s.precisionRecall,
-        sources: (this.sources || []).map(x => ({ source_id: x.id, enabled: !!x.enabled, weight: +x.weight || 1 })),
+        // Empty list would 404 (no matching sources); null = all enabled.
+        sources: (this.sources && this.sources.length)
+          ? this.sources.map(x => ({ source_id: x.id, enabled: !!x.enabled, weight: +x.weight || 1 }))
+          : null,
         temperature: s.temperature,
         top_p: s.topP,
         max_tokens: s.maxTokens,
@@ -1060,7 +1090,7 @@
         presence_penalty: s.presencePenalty,
         frequency_penalty: s.frequencyPenalty,
         stop_sequences: this.stopSequences || [],
-        tone: s.tone,
+        tone: toneMap[toneRaw] || s.tone,
         faithfulness: s.faithfulness,
         confidence_threshold: s.confidence,
         filters: {
